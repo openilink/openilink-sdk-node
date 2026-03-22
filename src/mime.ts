@@ -52,6 +52,7 @@ const mimeToExt: Record<string, string> = {
   "video/x-msvideo": ".avi",
   "image/png": ".png",
   "image/jpeg": ".jpg",
+  "image/jpg": ".jpg",
   "image/gif": ".gif",
   "image/webp": ".webp",
   "image/bmp": ".bmp",
