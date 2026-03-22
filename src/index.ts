@@ -5,3 +5,4 @@ export * from "./errors.js";
 export * from "./message-helper.js";
 export * from "./mime.js";
 export * from "./types.js";
+export * from "./voice.js";

@@ -29,6 +29,7 @@ import { isImageMIME, isVideoMIME, MIMEFromFilename } from "./mime.js";
 import type {
   BaseInfo,
   ClientConfig,
+  CDNMedia,
   FileItem,
   GetConfigResponse,
   GetUpdatesResponse,
@@ -39,9 +40,11 @@ import type {
   MonitorOptions,
   QRCodeResponse,
   QRStatusResponse,
+  SILKDecoder,
   UploadResult,
   WeixinMessage,
 } from "./types.js";
+import { buildWAV, DEFAULT_VOICE_SAMPLE_RATE } from "./voice.js";
 
 const DEFAULT_LONG_POLL_TIMEOUT = 35_000;
 const DEFAULT_API_TIMEOUT = 15_000;
@@ -62,6 +65,7 @@ export class Client {
   botType: string;
   version: string;
   routeTag: string;
+  silkDecoder?: SILKDecoder;
 
   private readonly contextTokens = new Map<string, string>();
 
@@ -72,6 +76,7 @@ export class Client {
     this.botType = config.bot_type ?? DEFAULT_BOT_TYPE;
     this.version = config.version ?? "1.0.2";
     this.routeTag = config.route_tag ?? "";
+    this.silkDecoder = config.silk_decoder;
   }
 
   setToken(token: string): void {
@@ -96,6 +101,10 @@ export class Client {
 
   setRouteTag(routeTag: string): void {
     this.routeTag = routeTag;
+  }
+
+  setSILKDecoder(silkDecoder: SILKDecoder): void {
+    this.silkDecoder = silkDecoder;
   }
 
   async getUpdates(getUpdatesBuf = "", timeoutMs = DEFAULT_LONG_POLL_TIMEOUT): Promise<GetUpdatesResponse> {
@@ -553,6 +562,22 @@ export class Client {
   async downloadRaw(encryptedQueryParam: string): Promise<Uint8Array> {
     const downloadUrl = buildCdnDownloadUrl(this.cdnBaseUrl, encryptedQueryParam);
     return this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
+  }
+
+  async downloadVoice(media: CDNMedia | undefined): Promise<Uint8Array> {
+    if (!this.silkDecoder) {
+      throw new Error("ilink: no SILK decoder configured; use config.silk_decoder or setSILKDecoder");
+    }
+
+    if (!media) {
+      throw new Error("ilink: voice media is nil");
+    }
+
+    const encryptedQueryParam = media.encrypt_query_param ?? "";
+    const aesKey = media.aes_key ?? "";
+    const silkData = await this.downloadFile(encryptedQueryParam, aesKey);
+    const pcm = await this.silkDecoder(silkData, DEFAULT_VOICE_SAMPLE_RATE);
+    return buildWAV(pcm, DEFAULT_VOICE_SAMPLE_RATE, 1, 16);
   }
 
   setContextToken(userId: string, token: string): void {

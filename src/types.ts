@@ -2,6 +2,8 @@ export interface BaseInfo {
   channel_version?: string;
 }
 
+export type SILKDecoder = (silkData: Uint8Array, sampleRate: number) => Uint8Array | Promise<Uint8Array>;
+
 export interface CDNMedia {
   encrypt_query_param?: string;
   aes_key?: string;
@@ -168,6 +170,7 @@ export interface ClientConfig {
   bot_type?: string;
   version?: string;
   route_tag?: string;
+  silk_decoder?: SILKDecoder;
 }
 
 export interface UploadResult {
