@@ -1,7 +1,15 @@
 {
-  "name": "openilink-sdk-node",
+  "name": "@openilink/openilink-sdk-node",
   "version": "1.0.0",
   "description": "Node.js SDK for the OpenILink Bot API.",
+  "homepage": "https://github.com/openilink/openilink-sdk-node#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/openilink/openilink-sdk-node.git"
+  },
+  "bugs": {
+    "url": "https://github.com/openilink/openilink-sdk-node/issues"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -18,6 +26,10 @@
   ],
   "engines": {
     "node": ">=18"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",

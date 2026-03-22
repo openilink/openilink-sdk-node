@@ -1,6 +1,6 @@
-# openilink-sdk-node
+# @openilink/openilink-sdk-node
 
-`openilink-sdk-node` 是一个面向 OpenILink Bot API 的 Node.js SDK，提供常用能力的轻量封装，便于在 Node.js 项目中快速完成登录、收发消息和会话相关操作。
+`@openilink/openilink-sdk-node` 是一个面向 OpenILink Bot API 的 Node.js SDK，提供常用能力的轻量封装，便于在 Node.js 项目中快速完成登录、收发消息和会话相关操作。
 
 当前支持的核心能力：
 
@@ -15,7 +15,7 @@
 ## 安装
 
 ```bash
-npm install openilink-sdk-node
+npm install @openilink/openilink-sdk-node
 ```
 
 要求：
@@ -25,7 +25,7 @@ npm install openilink-sdk-node
 ## 快速开始
 
 ```ts
-import { Client, extractText } from "openilink-sdk-node";
+import { Client, extractText } from "@openilink/openilink-sdk-node";
 
 const client = new Client("");
 
