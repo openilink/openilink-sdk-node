@@ -1,32 +1,59 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  aesEcbPaddedSize,
+  buildCdnDownloadUrl,
+  buildCdnUploadUrl,
+  decryptAesEcb,
+  encryptAesEcb,
+  mediaAesKeyHex,
+  parseAESKey,
+  UPLOAD_MAX_RETRIES,
+} from "./cdn.js";
 import {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
   DEFAULT_CDN_BASE_URL,
+  ITEM_TYPE_FILE,
+  ITEM_TYPE_IMAGE,
   ITEM_TYPE_TEXT,
+  ITEM_TYPE_VIDEO,
+  MEDIA_FILE,
+  MEDIA_IMAGE,
+  MEDIA_VIDEO,
   MESSAGE_STATE_FINISH,
   MESSAGE_TYPE_BOT,
   SESSION_EXPIRED_ERR_CODE,
 } from "./constants.js";
-import { NoContextTokenError, RequestError } from "./errors.js";
+import { APIError, HTTPError, NoContextTokenError, RequestError } from "./errors.js";
+import { isImageMIME, isVideoMIME, MIMEFromFilename } from "./mime.js";
 import type {
   BaseInfo,
   ClientConfig,
+  FileItem,
+  GetConfigResponse,
   GetUpdatesResponse,
+  GetUploadURLRequest,
+  GetUploadURLResponse,
   LoginCallbacks,
   LoginResult,
   MonitorOptions,
+  QRCodeResponse,
+  QRStatusResponse,
+  UploadResult,
   WeixinMessage,
 } from "./types.js";
 
 const DEFAULT_LONG_POLL_TIMEOUT = 35_000;
 const DEFAULT_API_TIMEOUT = 15_000;
+const DEFAULT_CONFIG_TIMEOUT = 10_000;
 const QR_LONG_POLL_TIMEOUT = 35_000;
 const DEFAULT_LOGIN_TIMEOUT = 480_000;
+const DEFAULT_CDN_TIMEOUT = 60_000;
 const MAX_QR_REFRESH_COUNT = 3;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const BACKOFF_DELAY_MS = 30_000;
 const RETRY_DELAY_MS = 2_000;
+const SESSION_EXPIRED_PAUSE_MS = 3_600_000;
 
 export class Client {
   baseUrl: string;
@@ -34,6 +61,8 @@ export class Client {
   token: string;
   botType: string;
   version: string;
+  routeTag: string;
+
   private readonly contextTokens = new Map<string, string>();
 
   constructor(token = "", config: ClientConfig = {}) {
@@ -41,22 +70,48 @@ export class Client {
     this.cdnBaseUrl = config.cdn_base_url ?? DEFAULT_CDN_BASE_URL;
     this.token = token;
     this.botType = config.bot_type ?? DEFAULT_BOT_TYPE;
-    this.version = config.version ?? "1.0.0";
+    this.version = config.version ?? "1.0.2";
+    this.routeTag = config.route_tag ?? "";
   }
 
-  async getUpdates(getUpdatesBuf = ""): Promise<GetUpdatesResponse> {
+  setToken(token: string): void {
+    this.token = token;
+  }
+
+  setBaseUrl(baseUrl: string): void {
+    this.baseUrl = baseUrl;
+  }
+
+  setCdnBaseUrl(cdnBaseUrl: string): void {
+    this.cdnBaseUrl = cdnBaseUrl;
+  }
+
+  setBotType(botType: string): void {
+    this.botType = botType;
+  }
+
+  setVersion(version: string): void {
+    this.version = version;
+  }
+
+  setRouteTag(routeTag: string): void {
+    this.routeTag = routeTag;
+  }
+
+  async getUpdates(getUpdatesBuf = "", timeoutMs = DEFAULT_LONG_POLL_TIMEOUT): Promise<GetUpdatesResponse> {
     const request = {
       get_updates_buf: getUpdatesBuf,
       base_info: this.buildBaseInfo(),
     };
 
     try {
-      const body = await this.doPost("ilink/bot/getupdates", request, DEFAULT_LONG_POLL_TIMEOUT + 5_000);
+      const body = await this.doPost("ilink/bot/getupdates", request, timeoutMs);
       return this.decodeJson<GetUpdatesResponse>(body, "getUpdates");
     } catch (error) {
       if (error instanceof RequestError && error.isTimeout()) {
         return {
           ret: 0,
+          msgs: [],
           get_updates_buf: getUpdatesBuf,
         };
       }
@@ -77,7 +132,7 @@ export class Client {
   }
 
   async sendText(to: string, text: string, contextToken: string): Promise<string> {
-    const clientId = `sdk-${Date.now()}`;
+    const clientId = this.generateClientId();
 
     await this.sendMessage({
       to_user_id: to,
@@ -98,7 +153,7 @@ export class Client {
     return clientId;
   }
 
-  async getConfig(userId: string, contextToken: string): Promise<Record<string, unknown>> {
+  async getConfig(userId: string, contextToken: string): Promise<GetConfigResponse> {
     const body = await this.doPost(
       "ilink/bot/getconfig",
       {
@@ -106,10 +161,10 @@ export class Client {
         context_token: contextToken,
         base_info: this.buildBaseInfo(),
       },
-      10_000,
+      DEFAULT_CONFIG_TIMEOUT,
     );
 
-    return this.decodeJson<Record<string, unknown>>(body, "getConfig");
+    return this.decodeJson<GetConfigResponse>(body, "getConfig");
   }
 
   async sendTyping(userId: string, typingTicket: string, status: number): Promise<void> {
@@ -121,11 +176,11 @@ export class Client {
         status,
         base_info: this.buildBaseInfo(),
       },
-      10_000,
+      DEFAULT_CONFIG_TIMEOUT,
     );
   }
 
-  async getUploadUrl(request: Record<string, unknown>): Promise<Record<string, unknown>> {
+  async getUploadUrl(request: GetUploadURLRequest): Promise<GetUploadURLResponse> {
     const body = await this.doPost(
       "ilink/bot/getuploadurl",
       {
@@ -135,31 +190,32 @@ export class Client {
       DEFAULT_API_TIMEOUT,
     );
 
-    return this.decodeJson<Record<string, unknown>>(body, "getUploadUrl");
+    return this.decodeJson<GetUploadURLResponse>(body, "getUploadUrl");
   }
 
-  async fetchQRCode(): Promise<Record<string, unknown>> {
+  async fetchQRCode(): Promise<QRCodeResponse> {
     const url = new URL(this.buildUrl("ilink/bot/get_bot_qrcode"));
     url.searchParams.set("bot_type", this.botType || DEFAULT_BOT_TYPE);
 
-    const body = await this.doGet(url.toString(), {}, DEFAULT_API_TIMEOUT);
-    return this.decodeJson<Record<string, unknown>>(body, "fetchQRCode");
+    const body = await this.doGetText(url.toString(), this.routeTagHeaders(), DEFAULT_API_TIMEOUT);
+    return this.decodeJson<QRCodeResponse>(body, "fetchQRCode");
   }
 
-  async pollQRStatus(qrcode: string): Promise<Record<string, unknown>> {
+  async pollQRStatus(qrcode: string): Promise<QRStatusResponse> {
     const url = new URL(this.buildUrl("ilink/bot/get_qrcode_status"));
     url.searchParams.set("qrcode", qrcode);
 
     try {
-      const body = await this.doGet(
+      const body = await this.doGetText(
         url.toString(),
         {
+          ...this.routeTagHeaders(),
           "iLink-App-ClientVersion": "1",
         },
-        QR_LONG_POLL_TIMEOUT + 5_000,
+        QR_LONG_POLL_TIMEOUT,
       );
 
-      return this.decodeJson<Record<string, unknown>>(body, "pollQRStatus");
+      return this.decodeJson<QRStatusResponse>(body, "pollQRStatus");
     } catch (error) {
       if (error instanceof RequestError && error.isTimeout()) {
         return { status: "wait" };
@@ -172,9 +228,9 @@ export class Client {
   async loginWithQr(callbacks: LoginCallbacks = {}, timeoutMs = DEFAULT_LOGIN_TIMEOUT): Promise<LoginResult> {
     const deadline = Date.now() + timeoutMs;
     const qr = await this.fetchQRCode();
-    let currentQr = String(qr.qrcode ?? "");
+    let currentQr = qr.qrcode ?? "";
 
-    callbacks.on_qrcode?.(String(qr.qrcode_img_content ?? ""));
+    callbacks.on_qrcode?.(qr.qrcode_img_content ?? "");
 
     let scannedNotified = false;
     let refreshCount = 1;
@@ -182,7 +238,7 @@ export class Client {
     while (Date.now() <= deadline) {
       const status = await this.pollQRStatus(currentQr);
 
-      switch (String(status.status ?? "wait")) {
+      switch (status.status ?? "wait") {
         case "scaned":
           if (!scannedNotified) {
             scannedNotified = true;
@@ -195,7 +251,7 @@ export class Client {
           if (refreshCount > MAX_QR_REFRESH_COUNT) {
             return {
               connected: false,
-              message: "登录超时：二维码多次过期。",
+              message: "QR code expired too many times",
             };
           }
 
@@ -203,33 +259,33 @@ export class Client {
 
           {
             const refreshedQr = await this.fetchQRCode();
-            currentQr = String(refreshedQr.qrcode ?? "");
+            currentQr = refreshedQr.qrcode ?? "";
             scannedNotified = false;
-            callbacks.on_qrcode?.(String(refreshedQr.qrcode_img_content ?? ""));
+            callbacks.on_qrcode?.(refreshedQr.qrcode_img_content ?? "");
           }
           break;
 
         case "confirmed": {
-          const botId = String(status.ilink_bot_id ?? "");
+          const botId = status.ilink_bot_id ?? "";
           if (botId === "") {
             return {
               connected: false,
-              message: "登录失败：服务器未返回 bot ID。",
+              message: "server did not return bot ID",
             };
           }
 
-          this.token = String(status.bot_token ?? "");
+          this.token = status.bot_token ?? "";
           if (status.baseurl) {
-            this.baseUrl = String(status.baseurl);
+            this.baseUrl = status.baseurl;
           }
 
           return {
             connected: true,
-            bot_token: String(status.bot_token ?? ""),
+            bot_token: status.bot_token ?? "",
             bot_id: botId,
-            base_url: String(status.baseurl ?? ""),
-            user_id: String(status.ilink_user_id ?? ""),
-            message: "与微信连接成功！",
+            base_url: status.baseurl ?? "",
+            user_id: status.ilink_user_id ?? "",
+            message: "connected",
           };
         }
       }
@@ -239,20 +295,24 @@ export class Client {
 
     return {
       connected: false,
-      message: "登录超时，请重试。",
+      message: "login timeout",
     };
   }
 
-  async monitor(handler: (message: WeixinMessage) => void | Promise<void>, options: MonitorOptions = {}): Promise<void> {
+  async monitor(
+    handler: (message: WeixinMessage) => void | Promise<void>,
+    options: MonitorOptions = {},
+  ): Promise<void> {
     let buf = options.initial_buf ?? "";
     let failures = 0;
+    let nextTimeoutMs: number | undefined;
     const onError = options.on_error ?? (() => {});
 
     while (this.shouldContinue(options.should_continue)) {
       let response: GetUpdatesResponse;
 
       try {
-        response = await this.getUpdates(buf);
+        response = await this.getUpdates(buf, nextTimeoutMs);
       } catch (error) {
         failures += 1;
         onError(new Error(`getUpdates (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${this.errorMessage(error)}`));
@@ -267,23 +327,26 @@ export class Client {
         continue;
       }
 
+      if (typeof response.longpolling_timeout_ms === "number" && response.longpolling_timeout_ms > 0) {
+        nextTimeoutMs = response.longpolling_timeout_ms;
+      }
+
       const ret = Number(response.ret ?? 0);
       const errCode = Number(response.errcode ?? 0);
 
       if (ret !== 0 || errCode !== 0) {
-        if (ret === SESSION_EXPIRED_ERR_CODE || errCode === SESSION_EXPIRED_ERR_CODE) {
+        const apiError = new APIError(ret, errCode, String(response.errmsg ?? ""));
+
+        if (apiError.isSessionExpired()) {
           options.on_session_expired?.();
-          onError(new Error("session expired (errcode -14), pausing 5 min"));
-          await this.sleep(300_000, options.should_continue);
+          onError(apiError);
+          failures = 0;
+          await this.sleep(SESSION_EXPIRED_PAUSE_MS, options.should_continue);
           continue;
         }
 
         failures += 1;
-        onError(
-          new Error(
-            `getUpdates ret=${ret} errcode=${errCode} msg=${String(response.errmsg ?? "")} (${failures}/${MAX_CONSECUTIVE_FAILURES})`,
-          ),
-        );
+        onError(new Error(`getUpdates (${failures}/${MAX_CONSECUTIVE_FAILURES}): ${apiError.message}`));
 
         if (failures >= MAX_CONSECUTIVE_FAILURES) {
           failures = 0;
@@ -298,7 +361,7 @@ export class Client {
       failures = 0;
 
       if (response.get_updates_buf) {
-        buf = String(response.get_updates_buf);
+        buf = response.get_updates_buf;
         options.on_buf_update?.(buf);
       }
 
@@ -310,6 +373,186 @@ export class Client {
         await handler(message);
       }
     }
+  }
+
+  async sendImage(to: string, contextToken: string, uploaded: UploadResult): Promise<string> {
+    const clientId = this.generateClientId();
+
+    await this.sendMessage({
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MESSAGE_TYPE_BOT,
+      message_state: MESSAGE_STATE_FINISH,
+      context_token: contextToken,
+      item_list: [
+        {
+          type: ITEM_TYPE_IMAGE,
+          image_item: {
+            media: {
+              encrypt_query_param: uploaded.download_encrypted_query_param,
+              aes_key: mediaAesKeyHex(uploaded.aes_key),
+              encrypt_type: 1,
+            },
+            mid_size: uploaded.ciphertext_size,
+          },
+        },
+      ],
+    });
+
+    return clientId;
+  }
+
+  async sendVideo(to: string, contextToken: string, uploaded: UploadResult): Promise<string> {
+    const clientId = this.generateClientId();
+
+    await this.sendMessage({
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MESSAGE_TYPE_BOT,
+      message_state: MESSAGE_STATE_FINISH,
+      context_token: contextToken,
+      item_list: [
+        {
+          type: ITEM_TYPE_VIDEO,
+          video_item: {
+            media: {
+              encrypt_query_param: uploaded.download_encrypted_query_param,
+              aes_key: mediaAesKeyHex(uploaded.aes_key),
+              encrypt_type: 1,
+            },
+            video_size: uploaded.ciphertext_size,
+          },
+        },
+      ],
+    });
+
+    return clientId;
+  }
+
+  async sendFileAttachment(
+    to: string,
+    contextToken: string,
+    fileName: string,
+    uploaded: UploadResult,
+  ): Promise<string> {
+    const clientId = this.generateClientId();
+    const fileItem: FileItem = {
+      media: {
+        encrypt_query_param: uploaded.download_encrypted_query_param,
+        aes_key: mediaAesKeyHex(uploaded.aes_key),
+        encrypt_type: 1,
+      },
+      file_name: fileName,
+      len: String(uploaded.file_size),
+    };
+
+    await this.sendMessage({
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MESSAGE_TYPE_BOT,
+      message_state: MESSAGE_STATE_FINISH,
+      context_token: contextToken,
+      item_list: [
+        {
+          type: ITEM_TYPE_FILE,
+          file_item: fileItem,
+        },
+      ],
+    });
+
+    return clientId;
+  }
+
+  async sendMediaFile(
+    to: string,
+    contextToken: string,
+    data: Uint8Array | ArrayBuffer,
+    fileName: string,
+    caption = "",
+  ): Promise<void> {
+    const payload = this.toBuffer(data);
+    const mime = MIMEFromFilename(fileName);
+
+    let mediaType = MEDIA_FILE;
+    if (isVideoMIME(mime)) {
+      mediaType = MEDIA_VIDEO;
+    } else if (isImageMIME(mime)) {
+      mediaType = MEDIA_IMAGE;
+    }
+
+    const uploaded = await this.uploadFile(payload, to, mediaType);
+
+    if (caption !== "") {
+      await this.sendText(to, caption, contextToken);
+    }
+
+    if (isVideoMIME(mime)) {
+      await this.sendVideo(to, contextToken, uploaded);
+      return;
+    }
+
+    if (isImageMIME(mime)) {
+      await this.sendImage(to, contextToken, uploaded);
+      return;
+    }
+
+    await this.sendFileAttachment(to, contextToken, fileName.split(/[\\/]/).pop() ?? fileName, uploaded);
+  }
+
+  async uploadFile(
+    plaintext: Uint8Array | ArrayBuffer,
+    toUserId: string,
+    mediaType: number,
+  ): Promise<UploadResult> {
+    const plainBytes = this.toBuffer(plaintext);
+    const rawSize = plainBytes.byteLength;
+    const rawMd5 = createHash("md5").update(plainBytes).digest("hex");
+    const fileSize = aesEcbPaddedSize(rawSize);
+    const fileKey = this.randomHex(16);
+    const aesKey = randomBytes(16);
+
+    const uploadResponse = await this.getUploadUrl({
+      filekey: fileKey,
+      media_type: mediaType,
+      to_user_id: toUserId,
+      rawsize: rawSize,
+      rawfilemd5: rawMd5,
+      filesize: fileSize,
+      no_need_thumb: true,
+      aeskey: aesKey.toString("hex"),
+    });
+
+    if ((uploadResponse.ret ?? 0) !== 0) {
+      throw new APIError(uploadResponse.ret ?? 0, 0, uploadResponse.errmsg ?? "");
+    }
+
+    if (!uploadResponse.upload_param) {
+      throw new Error("ilink: getUploadUrl returned no upload_param");
+    }
+
+    const ciphertext = encryptAesEcb(plainBytes, aesKey);
+    const cdnUrl = buildCdnUploadUrl(this.cdnBaseUrl, uploadResponse.upload_param, fileKey);
+    const downloadParam = await this.uploadToCDN(cdnUrl, ciphertext);
+
+    return {
+      file_key: fileKey,
+      download_encrypted_query_param: downloadParam,
+      aes_key: aesKey.toString("hex"),
+      file_size: rawSize,
+      ciphertext_size: ciphertext.byteLength,
+    };
+  }
+
+  async downloadFile(encryptedQueryParam: string, aesKeyBase64: string): Promise<Uint8Array> {
+    const key = parseAESKey(aesKeyBase64);
+    const downloadUrl = buildCdnDownloadUrl(this.cdnBaseUrl, encryptedQueryParam);
+    const ciphertext = await this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
+    return decryptAesEcb(ciphertext, key);
+  }
+
+  async downloadRaw(encryptedQueryParam: string): Promise<Uint8Array> {
+    const downloadUrl = buildCdnDownloadUrl(this.cdnBaseUrl, encryptedQueryParam);
+    return this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
   }
 
   setContextToken(userId: string, token: string): void {
@@ -339,58 +582,138 @@ export class Client {
     return `${this.baseUrl.replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
   }
 
-  private async doPost(endpoint: string, payload: Record<string, unknown>, timeoutMs: number): Promise<string> {
-    const body = JSON.stringify(payload);
+  private buildHeaders(body?: string | Buffer, extraHeaders: Record<string, string> = {}): Record<string, string> {
     const headers: Record<string, string> = {
-      "Content-Type": "application/json",
       AuthorizationType: "ilink_bot_token",
-      "Content-Length": String(Buffer.byteLength(body)),
       "X-WECHAT-UIN": this.randomWechatUin(),
+      ...extraHeaders,
     };
+
+    if (typeof body === "string" || body instanceof Uint8Array) {
+      headers["Content-Length"] = String(typeof body === "string" ? Buffer.byteLength(body) : body.byteLength);
+    }
 
     if (this.token) {
       headers.Authorization = `Bearer ${this.token}`;
     }
 
-    return this.request("POST", this.buildUrl(endpoint), headers, body, timeoutMs);
+    if (this.routeTag) {
+      headers.SKRouteTag = this.routeTag;
+    }
+
+    return headers;
   }
 
-  private async doGet(url: string, headers: Record<string, string>, timeoutMs: number): Promise<string> {
-    return this.request("GET", url, headers, undefined, timeoutMs);
+  private routeTagHeaders(): Record<string, string> {
+    return this.routeTag ? { SKRouteTag: this.routeTag } : {};
   }
 
-  private async request(
+  private async doPost(endpoint: string, payload: Record<string, unknown>, timeoutMs: number): Promise<string> {
+    const body = JSON.stringify(payload);
+    return this.requestText(
+      "POST",
+      this.buildUrl(endpoint),
+      this.buildHeaders(body, { "Content-Type": "application/json" }),
+      body,
+      timeoutMs,
+    );
+  }
+
+  private async doGetText(url: string, headers: Record<string, string>, timeoutMs: number): Promise<string> {
+    return this.requestText("GET", url, headers, undefined, timeoutMs);
+  }
+
+  private async doGetBytes(url: string, headers: Record<string, string>, timeoutMs: number): Promise<Uint8Array> {
+    const response = await this.fetchResponse("GET", url, headers, undefined, timeoutMs);
+    const body = new Uint8Array(await response.arrayBuffer());
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new HTTPError(response.status, this.toBuffer(body), this.headersToRecord(response.headers));
+    }
+
+    return body;
+  }
+
+  private async uploadToCDN(cdnUrl: string, ciphertext: Uint8Array): Promise<string> {
+    let lastError: unknown;
+
+    for (let attempt = 1; attempt <= UPLOAD_MAX_RETRIES; attempt += 1) {
+      try {
+        return await this.doUpload(cdnUrl, ciphertext);
+      } catch (error) {
+        lastError = error;
+
+        if (error instanceof HTTPError && error.statusCode >= 400 && error.statusCode < 500) {
+          throw error;
+        }
+
+        if (attempt < UPLOAD_MAX_RETRIES) {
+          await this.sleep(RETRY_DELAY_MS);
+        }
+      }
+    }
+
+    throw new Error(`ilink: cdn upload failed after ${UPLOAD_MAX_RETRIES} attempts: ${this.errorMessage(lastError)}`);
+  }
+
+  private async doUpload(cdnUrl: string, body: Uint8Array): Promise<string> {
+    const payload = this.toBuffer(body);
+    const response = await this.fetchResponse(
+      "POST",
+      cdnUrl,
+      this.buildHeaders(payload, { "Content-Type": "application/octet-stream" }),
+      payload,
+      DEFAULT_CDN_TIMEOUT,
+    );
+    const responseBody = Buffer.from(await response.arrayBuffer());
+
+    if (response.status !== 200) {
+      throw new HTTPError(response.status, responseBody, this.headersToRecord(response.headers));
+    }
+
+    const downloadParam = response.headers.get("x-encrypted-param");
+    if (!downloadParam) {
+      throw new Error("ilink: cdn response missing x-encrypted-param header");
+    }
+
+    return downloadParam;
+  }
+
+  private async requestText(
     method: string,
     url: string,
     headers: Record<string, string>,
-    body: string | undefined,
+    body: string | Buffer | undefined,
     timeoutMs: number,
   ): Promise<string> {
+    const response = await this.fetchResponse(method, url, headers, body, timeoutMs);
+    const responseBody = await response.text();
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new HTTPError(response.status, responseBody, this.headersToRecord(response.headers));
+    }
+
+    return responseBody;
+  }
+
+  private async fetchResponse(
+    method: string,
+    url: string,
+    headers: Record<string, string>,
+    body: string | Buffer | undefined,
+    timeoutMs: number,
+  ): Promise<Response> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      const response = await fetch(url, {
+      return await fetch(url, {
         method,
         headers,
-        body,
+        body: body as BodyInit | undefined,
         signal: controller.signal,
       });
-
-      const responseBody = await response.text();
-      if (response.status >= 400) {
-        throw new RequestError(`HTTP ${response.status}: ${responseBody}`, {
-          statusCode: response.status,
-          responseBody,
-        });
-      }
-
-      return responseBody;
     } catch (error) {
-      if (error instanceof RequestError) {
-        throw error;
-      }
-
       throw new RequestError(`HTTP request failed: ${this.errorMessage(error)}`, { cause: error });
     } finally {
       clearTimeout(timer);
@@ -413,9 +736,39 @@ export class Client {
     return decoded as T;
   }
 
+  private headersToRecord(headers: Headers): Record<string, string> {
+    const record: Record<string, string> = {};
+
+    headers.forEach((value, key) => {
+      record[key.toLowerCase()] = value;
+    });
+
+    return record;
+  }
+
   private randomWechatUin(): string {
     const value = randomBytes(4).readUInt32BE(0).toString(10);
     return Buffer.from(value).toString("base64");
+  }
+
+  private generateClientId(): string {
+    return `sdk-${Date.now()}-${randomBytes(4).toString("hex")}`;
+  }
+
+  private randomHex(n: number): string {
+    return randomBytes(n).toString("hex");
+  }
+
+  private toBuffer(data: Uint8Array | ArrayBuffer): Buffer {
+    if (Buffer.isBuffer(data)) {
+      return data;
+    }
+
+    if (data instanceof ArrayBuffer) {
+      return Buffer.from(data);
+    }
+
+    return Buffer.from(data.buffer, data.byteOffset, data.byteLength);
   }
 
   private shouldContinue(callback?: () => boolean): boolean {

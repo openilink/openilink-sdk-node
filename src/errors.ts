@@ -1,13 +1,45 @@
-export class RequestError extends Error {
-  statusCode?: number;
-  responseBody?: string;
-  cause?: unknown;
+import { SESSION_EXPIRED_ERR_CODE } from "./constants.js";
 
-  constructor(message: string, options: { statusCode?: number; responseBody?: string; cause?: unknown } = {}) {
+export class APIError extends Error {
+  readonly ret: number;
+  readonly errCode: number;
+  readonly errMsg: string;
+
+  constructor(ret: number, errCode: number, errMsg: string) {
+    super(`ilink: api error ret=${ret} errcode=${errCode} errmsg=${errMsg}`);
+    this.name = "APIError";
+    this.ret = ret;
+    this.errCode = errCode;
+    this.errMsg = errMsg;
+  }
+
+  isSessionExpired(): boolean {
+    return this.errCode === SESSION_EXPIRED_ERR_CODE || this.ret === SESSION_EXPIRED_ERR_CODE;
+  }
+}
+
+export class HTTPError extends Error {
+  readonly statusCode: number;
+  readonly body: string | Uint8Array;
+  readonly headers: Record<string, string>;
+
+  constructor(statusCode: number, body: string | Uint8Array, headers: Record<string, string> = {}) {
+    const bodyText =
+      typeof body === "string" ? body : Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8");
+    super(`ilink: http ${statusCode}: ${bodyText}`);
+    this.name = "HTTPError";
+    this.statusCode = statusCode;
+    this.body = body;
+    this.headers = headers;
+  }
+}
+
+export class RequestError extends Error {
+  readonly cause?: unknown;
+
+  constructor(message: string, options: { cause?: unknown } = {}) {
     super(message);
     this.name = "RequestError";
-    this.statusCode = options.statusCode;
-    this.responseBody = options.responseBody;
     this.cause = options.cause;
   }
 
@@ -18,7 +50,7 @@ export class RequestError extends Error {
 
 export class NoContextTokenError extends Error {
   constructor() {
-    super("No cached context token for this user; user must send a message first.");
+    super("ilink: no cached context token; user must send a message first");
     this.name = "NoContextTokenError";
   }
 }

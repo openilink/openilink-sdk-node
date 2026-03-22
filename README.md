@@ -7,10 +7,13 @@
 - 二维码登录
 - 长轮询接收消息
 - 发送文本消息
+- 发送图片、视频、文件消息
 - 获取会话配置
 - 发送打字状态
+- CDN 上传下载与 AES-128-ECB 加解密
 - 获取上传 URL
 - 缓存 `context_token` 并主动推送文本
+- 结构化错误类型（`APIError`、`HTTPError`）
 
 ## 安装
 
@@ -63,7 +66,8 @@ const client = new Client("", {
   base_url: "https://ilinkai.weixin.qq.com",
   cdn_base_url: "https://novac2c.cdn.weixin.qq.com/c2c",
   bot_type: "3",
-  version: "1.0.0",
+  version: "1.0.2",
+  route_tag: "gray-a",
 });
 ```
 
@@ -86,7 +90,7 @@ const result = await client.loginWithQr({
   bot_id: "xxx",
   base_url: "https://...",
   user_id: "xxx",
-  message: "与微信连接成功！",
+  message: "connected",
 }
 ```
 
@@ -125,6 +129,17 @@ const clientId = await client.sendText(toUserId, "hello", contextToken);
 const clientId = await client.push(toUserId, "hello");
 ```
 
+发送媒体：
+
+```ts
+import { MEDIA_IMAGE } from "@openilink/openilink-sdk-node";
+
+const uploaded = await client.uploadFile(fileBytes, toUserId, MEDIA_IMAGE);
+await client.sendImage(toUserId, contextToken, uploaded);
+
+await client.sendMediaFile(toUserId, contextToken, fileBytes, "report.pdf", "请查收");
+```
+
 ### 工具方法
 
 提取文本：
@@ -152,4 +167,29 @@ const upload = await client.getUploadUrl({
   no_need_thumb: true,
   aeskey: "...",
 });
+```
+
+CDN 下载：
+
+```ts
+const raw = await client.downloadRaw(encryptedQueryParam);
+const plain = await client.downloadFile(encryptedQueryParam, aesKeyBase64);
+```
+
+错误处理：
+
+```ts
+import { APIError, HTTPError, NoContextTokenError } from "@openilink/openilink-sdk-node";
+
+if (error instanceof APIError && error.isSessionExpired()) {
+  // 重新登录
+}
+
+if (error instanceof HTTPError) {
+  console.log(error.statusCode);
+}
+
+if (error instanceof NoContextTokenError) {
+  // 用户还没有 context_token
+}
 ```
