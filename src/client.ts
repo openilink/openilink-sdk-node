@@ -143,21 +143,16 @@ export class Client {
   async sendText(to: string, text: string, contextToken: string): Promise<string> {
     const clientId = this.generateClientId();
 
-    await this.sendMessage({
-      to_user_id: to,
-      client_id: clientId,
-      message_type: MESSAGE_TYPE_BOT,
-      message_state: MESSAGE_STATE_FINISH,
-      context_token: contextToken,
-      item_list: [
+    await this.sendMessage(
+      this.buildOutgoingMessage(to, clientId, contextToken, [
         {
           type: ITEM_TYPE_TEXT,
           text_item: {
             text,
           },
         },
-      ],
-    });
+      ]),
+    );
 
     return clientId;
   }
@@ -387,13 +382,8 @@ export class Client {
   async sendImage(to: string, contextToken: string, uploaded: UploadResult): Promise<string> {
     const clientId = this.generateClientId();
 
-    await this.sendMessage({
-      to_user_id: to,
-      client_id: clientId,
-      message_type: MESSAGE_TYPE_BOT,
-      message_state: MESSAGE_STATE_FINISH,
-      context_token: contextToken,
-      item_list: [
+    await this.sendMessage(
+      this.buildOutgoingMessage(to, clientId, contextToken, [
         {
           type: ITEM_TYPE_IMAGE,
           image_item: {
@@ -405,8 +395,8 @@ export class Client {
             mid_size: uploaded.ciphertext_size,
           },
         },
-      ],
-    });
+      ]),
+    );
 
     return clientId;
   }
@@ -414,13 +404,8 @@ export class Client {
   async sendVideo(to: string, contextToken: string, uploaded: UploadResult): Promise<string> {
     const clientId = this.generateClientId();
 
-    await this.sendMessage({
-      to_user_id: to,
-      client_id: clientId,
-      message_type: MESSAGE_TYPE_BOT,
-      message_state: MESSAGE_STATE_FINISH,
-      context_token: contextToken,
-      item_list: [
+    await this.sendMessage(
+      this.buildOutgoingMessage(to, clientId, contextToken, [
         {
           type: ITEM_TYPE_VIDEO,
           video_item: {
@@ -432,8 +417,8 @@ export class Client {
             video_size: uploaded.ciphertext_size,
           },
         },
-      ],
-    });
+      ]),
+    );
 
     return clientId;
   }
@@ -455,19 +440,14 @@ export class Client {
       len: String(uploaded.file_size),
     };
 
-    await this.sendMessage({
-      to_user_id: to,
-      client_id: clientId,
-      message_type: MESSAGE_TYPE_BOT,
-      message_state: MESSAGE_STATE_FINISH,
-      context_token: contextToken,
-      item_list: [
+    await this.sendMessage(
+      this.buildOutgoingMessage(to, clientId, contextToken, [
         {
           type: ITEM_TYPE_FILE,
           file_item: fileItem,
         },
-      ],
-    });
+      ]),
+    );
 
     return clientId;
   }
@@ -618,8 +598,9 @@ export class Client {
       headers["Content-Length"] = String(typeof body === "string" ? Buffer.byteLength(body) : body.byteLength);
     }
 
-    if (this.token) {
-      headers.Authorization = `Bearer ${this.token}`;
+    const token = this.token.trim();
+    if (token) {
+      headers.Authorization = `Bearer ${token}`;
     }
 
     if (this.routeTag) {
@@ -627,6 +608,15 @@ export class Client {
     }
 
     return headers;
+  }
+
+  private buildUploadHeaders(body: Buffer | Uint8Array): Record<string, string> {
+    const payload = Buffer.isBuffer(body) ? body : Buffer.from(body.buffer, body.byteOffset, body.byteLength);
+
+    return {
+      "Content-Type": "application/octet-stream",
+      "Content-Length": String(payload.byteLength),
+    };
   }
 
   private routeTagHeaders(): Record<string, string> {
@@ -686,14 +676,17 @@ export class Client {
     const response = await this.fetchResponse(
       "POST",
       cdnUrl,
-      this.buildHeaders(payload, { "Content-Type": "application/octet-stream" }),
+      this.buildUploadHeaders(payload),
       payload,
       DEFAULT_CDN_TIMEOUT,
     );
     const responseBody = Buffer.from(await response.arrayBuffer());
 
     if (response.status !== 200) {
-      throw new HTTPError(response.status, responseBody, this.headersToRecord(response.headers));
+      const responseHeaders = this.headersToRecord(response.headers);
+      const errorMessage =
+        response.headers.get("x-error-message") || responseBody.toString("utf8") || `status ${response.status}`;
+      throw new HTTPError(response.status, errorMessage, responseHeaders);
     }
 
     const downloadParam = response.headers.get("x-encrypted-param");
@@ -736,6 +729,7 @@ export class Client {
         method,
         headers,
         body: body as BodyInit | undefined,
+        redirect: "manual",
         signal: controller.signal,
       });
     } catch (error) {
@@ -769,6 +763,23 @@ export class Client {
     });
 
     return record;
+  }
+
+  private buildOutgoingMessage(
+    to: string,
+    clientId: string,
+    contextToken: string,
+    itemList: Array<Record<string, unknown>>,
+  ): Record<string, unknown> {
+    return {
+      from_user_id: "",
+      to_user_id: to,
+      client_id: clientId,
+      message_type: MESSAGE_TYPE_BOT,
+      message_state: MESSAGE_STATE_FINISH,
+      context_token: contextToken,
+      item_list: itemList,
+    };
   }
 
   private randomWechatUin(): string {
