@@ -2,6 +2,16 @@ export interface BaseInfo {
   channel_version?: string;
 }
 
+export interface APIResponse {
+  status_code: number;
+  headers: Record<string, string>;
+  body: string;
+}
+
+export interface RawResponseContainer {
+  raw_response?: APIResponse;
+}
+
 export type SILKDecoder = (silkData: Uint8Array, sampleRate: number) => Uint8Array | Promise<Uint8Array>;
 
 export interface CDNMedia {
@@ -91,16 +101,17 @@ export interface WeixinMessage {
   [key: string]: unknown;
 }
 
-export interface GetUpdatesResponse {
+export interface GetUpdatesResponse extends RawResponseContainer {
   ret?: number;
   errcode?: number;
   errmsg?: string;
   msgs?: WeixinMessage[];
   get_updates_buf?: string;
+  sync_buf?: string;
   longpolling_timeout_ms?: number;
 }
 
-export interface GetConfigResponse {
+export interface GetConfigResponse extends RawResponseContainer {
   ret?: number;
   errmsg?: string;
   typing_ticket?: string;
@@ -121,19 +132,19 @@ export interface GetUploadURLRequest {
   base_info?: BaseInfo;
 }
 
-export interface GetUploadURLResponse {
+export interface GetUploadURLResponse extends RawResponseContainer {
   ret?: number;
   errmsg?: string;
   upload_param?: string;
   thumb_upload_param?: string;
 }
 
-export interface QRCodeResponse {
+export interface QRCodeResponse extends RawResponseContainer {
   qrcode?: string;
   qrcode_img_content?: string;
 }
 
-export interface QRStatusResponse {
+export interface QRStatusResponse extends RawResponseContainer {
   status?: string;
   bot_token?: string;
   ilink_bot_id?: string;
@@ -161,6 +172,7 @@ export interface MonitorOptions {
   on_buf_update?: (buf: string) => void;
   on_error?: (error: Error) => void;
   on_session_expired?: () => void;
+  on_response?: (response: GetUpdatesResponse) => void;
   should_continue?: () => boolean;
 }
 
@@ -170,6 +182,7 @@ export interface ClientConfig {
   bot_type?: string;
   version?: string;
   route_tag?: string;
+  fetch_impl?: typeof fetch;
   silk_decoder?: SILKDecoder;
 }
 

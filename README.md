@@ -15,6 +15,7 @@ npm install @openilink/openilink-sdk-node
 - CDN 加密上传/下载（AES-128-ECB）
 - 语音消息解码（可插拔 SILK 解码器 + WAV 封装）
 - 输入状态指示器、Bot 配置
+- 可注入自定义 `fetch` 实现，便于测试、代理或自定义 Agent
 - `fetch` + `AbortController` 传输层，便于在 Node 18+ 环境直接使用
 - 结构化错误类型（`APIError`、`HTTPError`、`NoContextTokenError`、`RequestError`）
 - 零运行时依赖
@@ -64,6 +65,10 @@ await client.monitor(
   },
   {
     initial_buf: savedBuf,
+    on_response: (response) => {
+      console.log(response.sync_buf ?? "");
+      console.log(response.raw_response?.status_code ?? 0);
+    },
     on_buf_update: (buf) => {
       writeFileSync(syncBufFile, buf);
     },
@@ -84,6 +89,9 @@ const client = new Client(token, {
   bot_type: "3",
   version: "1.0.2",
   route_tag: "my-route-tag",
+  fetch_impl: async (input, init) => {
+    return fetch(input, init);
+  },
   silk_decoder: async (silkData, sampleRate) => {
     return decodeSilkSomehow(silkData, sampleRate);
   },
@@ -114,6 +122,7 @@ await client.monitor(
   },
   {
     initial_buf: savedBuf,
+    on_response: (response) => {},
     on_buf_update: (buf) => {},
     on_error: (error) => {},
     on_session_expired: () => {},
@@ -122,7 +131,7 @@ await client.monitor(
 );
 ```
 
-`monitor()` 会自动缓存每个用户的 `context_token`，供 `push()` 使用。服务端返回的 `longpolling_timeout_ms` 会被自动采纳。
+`monitor()` 会自动缓存每个用户的 `context_token`，供 `push()` 使用。服务端返回的 `longpolling_timeout_ms` 会被自动采纳；成功响应里的 `sync_buf` 和原始 HTTP 元数据可通过 `on_response` / `raw_response` 读取。
 
 ### 发送文本
 
@@ -164,7 +173,7 @@ for (const item of message.item_list ?? []) {
       break;
 
     case ITEM_TYPE_VOICE:
-      await client.downloadVoice(item.voice_item?.media);
+      await client.downloadVoice(item.voice_item);
       break;
   }
 }
@@ -183,7 +192,7 @@ const client = new Client(token, {
   },
 });
 
-const wav = await client.downloadVoice(voiceMedia);
+const wav = await client.downloadVoice(voiceItem);
 ```
 
 也可以单独使用 WAV 封装：
@@ -222,7 +231,7 @@ const image = isImageMIME("image/png");         // true
 const video = isVideoMIME("video/mp4");         // true
 ```
 
-### 错误处理
+## 错误处理
 
 ```ts
 import {

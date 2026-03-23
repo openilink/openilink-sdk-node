@@ -27,6 +27,7 @@ import {
 import { APIError, HTTPError, NoContextTokenError, RequestError } from "./errors.js";
 import { isImageMIME, isVideoMIME, MIMEFromFilename } from "./mime.js";
 import type {
+  APIResponse,
   BaseInfo,
   ClientConfig,
   CDNMedia,
@@ -42,6 +43,7 @@ import type {
   QRStatusResponse,
   SILKDecoder,
   UploadResult,
+  VoiceItem,
   WeixinMessage,
 } from "./types.js";
 import { buildWAV, DEFAULT_VOICE_SAMPLE_RATE } from "./voice.js";
@@ -66,6 +68,7 @@ export class Client {
   version: string;
   routeTag: string;
   silkDecoder?: SILKDecoder;
+  private readonly fetchImpl: typeof fetch;
 
   private readonly contextTokens = new Map<string, string>();
 
@@ -76,6 +79,7 @@ export class Client {
     this.botType = config.bot_type ?? DEFAULT_BOT_TYPE;
     this.version = config.version ?? "1.0.2";
     this.routeTag = config.route_tag ?? "";
+    this.fetchImpl = config.fetch_impl ?? fetch;
     this.silkDecoder = config.silk_decoder;
   }
 
@@ -114,8 +118,8 @@ export class Client {
     };
 
     try {
-      const body = await this.doPost("ilink/bot/getupdates", request, timeoutMs);
-      return this.decodeJson<GetUpdatesResponse>(body, "getUpdates");
+      const response = await this.doPost("ilink/bot/getupdates", request, timeoutMs);
+      return this.withRawResponse(this.decodeJson<GetUpdatesResponse>(response.body, "getUpdates"), response);
     } catch (error) {
       if (error instanceof RequestError && error.isTimeout()) {
         return {
@@ -158,7 +162,7 @@ export class Client {
   }
 
   async getConfig(userId: string, contextToken: string): Promise<GetConfigResponse> {
-    const body = await this.doPost(
+    const response = await this.doPost(
       "ilink/bot/getconfig",
       {
         ilink_user_id: userId,
@@ -168,7 +172,7 @@ export class Client {
       DEFAULT_CONFIG_TIMEOUT,
     );
 
-    return this.decodeJson<GetConfigResponse>(body, "getConfig");
+    return this.withRawResponse(this.decodeJson<GetConfigResponse>(response.body, "getConfig"), response);
   }
 
   async sendTyping(userId: string, typingTicket: string, status: number): Promise<void> {
@@ -185,7 +189,7 @@ export class Client {
   }
 
   async getUploadUrl(request: GetUploadURLRequest): Promise<GetUploadURLResponse> {
-    const body = await this.doPost(
+    const response = await this.doPost(
       "ilink/bot/getuploadurl",
       {
         ...request,
@@ -194,15 +198,25 @@ export class Client {
       DEFAULT_API_TIMEOUT,
     );
 
-    return this.decodeJson<GetUploadURLResponse>(body, "getUploadUrl");
+    return this.withRawResponse(this.decodeJson<GetUploadURLResponse>(response.body, "getUploadUrl"), response);
   }
 
   async fetchQRCode(): Promise<QRCodeResponse> {
     const url = new URL(this.buildUrl("ilink/bot/get_bot_qrcode"));
     url.searchParams.set("bot_type", this.botType || DEFAULT_BOT_TYPE);
 
-    const body = await this.doGetText(url.toString(), this.routeTagHeaders(), DEFAULT_API_TIMEOUT);
-    return this.decodeJson<QRCodeResponse>(body, "fetchQRCode");
+    let response: APIResponse;
+    try {
+      response = await this.doGetText(url.toString(), this.routeTagHeaders(), DEFAULT_API_TIMEOUT);
+    } catch (error) {
+      throw new Error(`ilink: fetch QR code: ${this.errorMessage(error)}`, { cause: error });
+    }
+
+    try {
+      return this.withRawResponse(this.decodeJson<QRCodeResponse>(response.body, "fetchQRCode"), response);
+    } catch (error) {
+      throw new Error(`ilink: unmarshal QR response: ${this.errorMessage(error)}`, { cause: error });
+    }
   }
 
   async pollQRStatus(qrcode: string): Promise<QRStatusResponse> {
@@ -210,7 +224,7 @@ export class Client {
     url.searchParams.set("qrcode", qrcode);
 
     try {
-      const body = await this.doGetText(
+      const response = await this.doGetText(
         url.toString(),
         {
           ...this.routeTagHeaders(),
@@ -219,7 +233,11 @@ export class Client {
         QR_LONG_POLL_TIMEOUT,
       );
 
-      return this.decodeJson<QRStatusResponse>(body, "pollQRStatus");
+      try {
+        return this.withRawResponse(this.decodeJson<QRStatusResponse>(response.body, "pollQRStatus"), response);
+      } catch (error) {
+        throw new Error(`ilink: unmarshal QR status: ${this.errorMessage(error)}`, { cause: error });
+      }
     } catch (error) {
       if (error instanceof RequestError && error.isTimeout()) {
         return { status: "wait" };
@@ -240,7 +258,12 @@ export class Client {
     let refreshCount = 1;
 
     while (Date.now() <= deadline) {
-      const status = await this.pollQRStatus(currentQr);
+      let status: QRStatusResponse;
+      try {
+        status = await this.pollQRStatus(currentQr);
+      } catch (error) {
+        throw new Error(`ilink: poll QR status: ${this.errorMessage(error)}`, { cause: error });
+      }
 
       switch (status.status ?? "wait") {
         case "scaned":
@@ -262,7 +285,12 @@ export class Client {
           callbacks.on_expired?.(refreshCount, MAX_QR_REFRESH_COUNT);
 
           {
-            const refreshedQr = await this.fetchQRCode();
+            let refreshedQr: QRCodeResponse;
+            try {
+              refreshedQr = await this.fetchQRCode();
+            } catch (error) {
+              throw new Error(`ilink: refresh QR code: ${this.errorMessage(error)}`, { cause: error });
+            }
             currentQr = refreshedQr.qrcode ?? "";
             scannedNotified = false;
             callbacks.on_qrcode?.(refreshedQr.qrcode_img_content ?? "");
@@ -363,6 +391,7 @@ export class Client {
       }
 
       failures = 0;
+      options.on_response?.(response);
 
       if (response.get_updates_buf) {
         buf = response.get_updates_buf;
@@ -469,23 +498,36 @@ export class Client {
       mediaType = MEDIA_IMAGE;
     }
 
-    const uploaded = await this.uploadFile(payload, to, mediaType);
+    let uploaded: UploadResult;
+    try {
+      uploaded = await this.uploadFile(payload, to, mediaType);
+    } catch (error) {
+      throw new Error(`ilink: upload media: ${this.errorMessage(error)}`, { cause: error });
+    }
 
     if (caption !== "") {
-      await this.sendText(to, caption, contextToken);
+      try {
+        await this.sendText(to, caption, contextToken);
+      } catch (error) {
+        throw new Error(`ilink: send caption: ${this.errorMessage(error)}`, { cause: error });
+      }
     }
 
-    if (isVideoMIME(mime)) {
-      await this.sendVideo(to, contextToken, uploaded);
-      return;
-    }
+    try {
+      if (isVideoMIME(mime)) {
+        await this.sendVideo(to, contextToken, uploaded);
+        return;
+      }
 
-    if (isImageMIME(mime)) {
-      await this.sendImage(to, contextToken, uploaded);
-      return;
-    }
+      if (isImageMIME(mime)) {
+        await this.sendImage(to, contextToken, uploaded);
+        return;
+      }
 
-    await this.sendFileAttachment(to, contextToken, fileName.split(/[\\/]/).pop() ?? fileName, uploaded);
+      await this.sendFileAttachment(to, contextToken, fileName.split(/[\\/]/).pop() ?? fileName, uploaded);
+    } catch (error) {
+      throw new Error(`ilink: send media: ${this.errorMessage(error)}`, { cause: error });
+    }
   }
 
   async uploadFile(
@@ -544,20 +586,33 @@ export class Client {
     return this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
   }
 
-  async downloadVoice(media: CDNMedia | undefined): Promise<Uint8Array> {
+  async downloadVoice(voice: VoiceItem | undefined): Promise<Uint8Array> {
     if (!this.silkDecoder) {
       throw new Error("ilink: no SILK decoder configured; use config.silk_decoder or setSILKDecoder");
     }
 
-    if (!media) {
-      throw new Error("ilink: voice media is nil");
+    if (!voice?.media) {
+      throw new Error("ilink: voice item or media is nil");
     }
 
-    const encryptedQueryParam = media.encrypt_query_param ?? "";
-    const aesKey = media.aes_key ?? "";
-    const silkData = await this.downloadFile(encryptedQueryParam, aesKey);
-    const pcm = await this.silkDecoder(silkData, DEFAULT_VOICE_SAMPLE_RATE);
-    return buildWAV(pcm, DEFAULT_VOICE_SAMPLE_RATE, 1, 16);
+    const encryptedQueryParam = voice.media.encrypt_query_param ?? "";
+    const aesKey = voice.media.aes_key ?? "";
+    let silkData: Uint8Array;
+    try {
+      silkData = await this.downloadFile(encryptedQueryParam, aesKey);
+    } catch (error) {
+      throw new Error(`ilink: download voice: ${this.errorMessage(error)}`, { cause: error });
+    }
+
+    let pcm: Uint8Array;
+    const sampleRate = typeof voice.sample_rate === "number" && voice.sample_rate > 0 ? voice.sample_rate : DEFAULT_VOICE_SAMPLE_RATE;
+    try {
+      pcm = await this.silkDecoder(silkData, sampleRate);
+    } catch (error) {
+      throw new Error(`ilink: decode voice: ${this.errorMessage(error)}`, { cause: error });
+    }
+
+    return buildWAV(pcm, sampleRate, 1, 16);
   }
 
   setContextToken(userId: string, token: string): void {
@@ -623,7 +678,7 @@ export class Client {
     return this.routeTag ? { SKRouteTag: this.routeTag } : {};
   }
 
-  private async doPost(endpoint: string, payload: Record<string, unknown>, timeoutMs: number): Promise<string> {
+  private async doPost(endpoint: string, payload: Record<string, unknown>, timeoutMs: number): Promise<APIResponse> {
     const body = JSON.stringify(payload);
     return this.requestText(
       "POST",
@@ -634,7 +689,7 @@ export class Client {
     );
   }
 
-  private async doGetText(url: string, headers: Record<string, string>, timeoutMs: number): Promise<string> {
+  private async doGetText(url: string, headers: Record<string, string>, timeoutMs: number): Promise<APIResponse> {
     return this.requestText("GET", url, headers, undefined, timeoutMs);
   }
 
@@ -703,15 +758,16 @@ export class Client {
     headers: Record<string, string>,
     body: string | Buffer | undefined,
     timeoutMs: number,
-  ): Promise<string> {
+  ): Promise<APIResponse> {
     const response = await this.fetchResponse(method, url, headers, body, timeoutMs);
     const responseBody = await response.text();
+    const rawResponse = this.toRawResponse(response, responseBody);
 
     if (response.status < 200 || response.status >= 300) {
-      throw new HTTPError(response.status, responseBody, this.headersToRecord(response.headers));
+      throw new HTTPError(response.status, responseBody, rawResponse.headers);
     }
 
-    return responseBody;
+    return rawResponse;
   }
 
   private async fetchResponse(
@@ -725,7 +781,7 @@ export class Client {
     const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
-      return await fetch(url, {
+      return await this.fetchImpl(url, {
         method,
         headers,
         body: body as BodyInit | undefined,
@@ -763,6 +819,21 @@ export class Client {
     });
 
     return record;
+  }
+
+  private toRawResponse(response: Response, body: string): APIResponse {
+    return {
+      status_code: response.status,
+      headers: this.headersToRecord(response.headers),
+      body,
+    };
+  }
+
+  private withRawResponse<T extends object>(decoded: T, rawResponse: APIResponse): T {
+    return {
+      ...decoded,
+      raw_response: rawResponse,
+    } as T;
   }
 
   private buildOutgoingMessage(

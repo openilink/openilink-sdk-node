@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { Client } from "../dist/client.js";
 import { buildWAV } from "../dist/voice.js";
 
 test("buildWAV emits a valid mono PCM header", () => {
@@ -31,4 +32,79 @@ test("buildWAV updates stereo-specific byte layout", () => {
   assert.equal(Buffer.from(wav).readUInt16LE(22), 2);
   assert.equal(Buffer.from(wav).readUInt32LE(28), 96_000);
   assert.equal(Buffer.from(wav).readUInt16LE(32), 4);
+});
+
+test("downloadVoice rejects missing decoder and nil voice item", async () => {
+  await assert.rejects(
+    new Client("token").downloadVoice({ media: { encrypt_query_param: "x", aes_key: "y" } }),
+    /no SILK decoder configured/,
+  );
+
+  const client = new Client("token", {
+    silk_decoder: async () => new Uint8Array(),
+  });
+
+  await assert.rejects(client.downloadVoice(undefined), /voice item or media is nil/);
+  await assert.rejects(client.downloadVoice({}), /voice item or media is nil/);
+});
+
+test("downloadVoice wraps download failures with Go-style context", async (t) => {
+  const client = new Client("token", {
+    silk_decoder: async () => new Uint8Array(),
+  });
+  const originalDownloadFile = client.downloadFile;
+
+  t.after(() => {
+    client.downloadFile = originalDownloadFile;
+  });
+
+  const downloadError = new Error("cdn failed");
+  client.downloadFile = async () => {
+    throw downloadError;
+  };
+
+  await assert.rejects(client.downloadVoice({ media: { encrypt_query_param: "x", aes_key: "yQ==" } }), (error) => {
+    assert.equal(error.message, "ilink: download voice: cdn failed");
+    assert.equal(error.cause, downloadError);
+    return true;
+  });
+});
+
+test("downloadVoice wraps decoder failures and honors voice sample_rate", async (t) => {
+  const client = new Client("token", {
+    silk_decoder: async () => new Uint8Array([1, 2, 3, 4]),
+  });
+  const originalDownloadFile = client.downloadFile;
+  const originalDecoder = client.silkDecoder;
+
+  t.after(() => {
+    client.downloadFile = originalDownloadFile;
+    client.silkDecoder = originalDecoder;
+  });
+
+  client.downloadFile = async () => Buffer.from("silk");
+  const decodeError = new Error("decoder failed");
+  client.silkDecoder = async () => {
+    throw decodeError;
+  };
+
+  await assert.rejects(client.downloadVoice({ media: { encrypt_query_param: "x", aes_key: "yQ==" } }), (error) => {
+    assert.equal(error.message, "ilink: decode voice: decoder failed");
+    assert.equal(error.cause, decodeError);
+    return true;
+  });
+
+  let seenSampleRate = 0;
+  client.silkDecoder = async (_data, sampleRate) => {
+    seenSampleRate = sampleRate;
+    return new Uint8Array([1, 2, 3, 4]);
+  };
+
+  const wav = await client.downloadVoice({
+    media: { encrypt_query_param: "x", aes_key: "yQ==" },
+    sample_rate: 16_000,
+  });
+
+  assert.equal(seenSampleRate, 16_000);
+  assert.equal(Buffer.from(wav).readUInt32LE(24), 16_000);
 });

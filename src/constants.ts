@@ -24,5 +24,6 @@ export const MEDIA_IMAGE = 1;
 export const MEDIA_VIDEO = 2;
 export const MEDIA_FILE = 3;
 export const MEDIA_VOICE = 4;
+export const ENCRYPT_AES128_ECB = 1;
 
 export const SESSION_EXPIRED_ERR_CODE = -14;

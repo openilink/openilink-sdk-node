@@ -1,6 +1,6 @@
 {
   "name": "@openilink/openilink-sdk-node",
-  "version": "0.3.3",
+  "version": "0.4.2",
   "description": "Node.js SDK for the OpenILink Bot API.",
   "homepage": "https://github.com/openilink/openilink-sdk-node#readme",
   "repository": {
