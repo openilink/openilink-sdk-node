@@ -1,6 +1,8 @@
 export const DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com";
 export const DEFAULT_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c";
 export const DEFAULT_BOT_TYPE = "3";
+export const ILINK_APP_ID = "bot";
+export const ILINK_CHANNEL_VERSION = "2.1.6";
 
 export const MESSAGE_TYPE_NONE = 0;
 export const MESSAGE_TYPE_USER = 1;

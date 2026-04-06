@@ -52,14 +52,14 @@ test("downloadVoice wraps download failures with Go-style context", async (t) =>
   const client = new Client("token", {
     silk_decoder: async () => new Uint8Array(),
   });
-  const originalDownloadFile = client.downloadFile;
+  const originalDownloadMedia = client.downloadMedia;
 
   t.after(() => {
-    client.downloadFile = originalDownloadFile;
+    client.downloadMedia = originalDownloadMedia;
   });
 
   const downloadError = new Error("cdn failed");
-  client.downloadFile = async () => {
+  client.downloadMedia = async () => {
     throw downloadError;
   };
 
@@ -74,15 +74,15 @@ test("downloadVoice wraps decoder failures and honors voice sample_rate", async 
   const client = new Client("token", {
     silk_decoder: async () => new Uint8Array([1, 2, 3, 4]),
   });
-  const originalDownloadFile = client.downloadFile;
+  const originalDownloadMedia = client.downloadMedia;
   const originalDecoder = client.silkDecoder;
 
   t.after(() => {
-    client.downloadFile = originalDownloadFile;
+    client.downloadMedia = originalDownloadMedia;
     client.silkDecoder = originalDecoder;
   });
 
-  client.downloadFile = async () => Buffer.from("silk");
+  client.downloadMedia = async () => Buffer.from("silk");
   const decodeError = new Error("decoder failed");
   client.silkDecoder = async () => {
     throw decodeError;

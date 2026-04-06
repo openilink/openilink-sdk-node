@@ -18,6 +18,7 @@ export interface CDNMedia {
   encrypt_query_param?: string;
   aes_key?: string;
   encrypt_type?: number;
+  full_url?: string;
 }
 
 export interface TextItem {
@@ -137,6 +138,7 @@ export interface GetUploadURLResponse extends RawResponseContainer {
   errmsg?: string;
   upload_param?: string;
   thumb_upload_param?: string;
+  upload_full_url?: string;
 }
 
 export interface QRCodeResponse extends RawResponseContainer {
@@ -150,6 +152,7 @@ export interface QRStatusResponse extends RawResponseContainer {
   ilink_bot_id?: string;
   baseurl?: string;
   ilink_user_id?: string;
+  redirect_host?: string;
 }
 
 export interface LoginResult {

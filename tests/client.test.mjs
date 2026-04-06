@@ -11,7 +11,7 @@ test("Client preserves defaults and explicit configuration", () => {
   assert.equal(client.baseUrl, DEFAULT_BASE_URL);
   assert.equal(client.cdnBaseUrl, DEFAULT_CDN_BASE_URL);
   assert.equal(client.botType, DEFAULT_BOT_TYPE);
-  assert.equal(client.version, "1.0.2");
+  assert.equal(client.version, "2.1.6");
 
   const custom = new Client("tok", {
     base_url: "https://custom.example.com",
@@ -72,7 +72,7 @@ test("getUpdates posts the expected payload and decodes the response", async (t)
 
     const payload = JSON.parse(init.body);
     assert.equal(payload.get_updates_buf, "cursor-0");
-    assert.deepEqual(payload.base_info, { channel_version: "1.0.2" });
+    assert.deepEqual(payload.base_info, { channel_version: "2.1.6" });
 
     return new Response(
       JSON.stringify({

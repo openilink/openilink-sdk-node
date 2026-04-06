@@ -87,7 +87,7 @@ const client = new Client(token, {
   base_url: "https://custom.endpoint.com",
   cdn_base_url: "https://custom.cdn.com/c2c",
   bot_type: "3",
-  version: "1.0.2",
+  version: "2.1.6",
   route_tag: "my-route-tag",
   fetch_impl: async (input, init) => {
     return fetch(input, init);
@@ -166,10 +166,7 @@ import { ITEM_TYPE_IMAGE, ITEM_TYPE_VOICE } from "@openilink/openilink-sdk-node"
 for (const item of message.item_list ?? []) {
   switch (item.type) {
     case ITEM_TYPE_IMAGE:
-      await client.downloadFile(
-        item.image_item?.media?.encrypt_query_param ?? "",
-        item.image_item?.media?.aes_key ?? "",
-      );
+      await client.downloadMedia(item.image_item?.media);
       break;
 
     case ITEM_TYPE_VOICE:

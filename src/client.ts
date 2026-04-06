@@ -13,6 +13,8 @@ import {
   DEFAULT_BASE_URL,
   DEFAULT_BOT_TYPE,
   DEFAULT_CDN_BASE_URL,
+  ILINK_APP_ID,
+  ILINK_CHANNEL_VERSION,
   ITEM_TYPE_FILE,
   ITEM_TYPE_IMAGE,
   ITEM_TYPE_TEXT,
@@ -68,6 +70,7 @@ export class Client {
   version: string;
   routeTag: string;
   silkDecoder?: SILKDecoder;
+  private loginBaseUrl: string;
   private readonly fetchImpl: typeof fetch;
 
   private readonly contextTokens = new Map<string, string>();
@@ -75,9 +78,10 @@ export class Client {
   constructor(token = "", config: ClientConfig = {}) {
     this.baseUrl = config.base_url ?? DEFAULT_BASE_URL;
     this.cdnBaseUrl = config.cdn_base_url ?? DEFAULT_CDN_BASE_URL;
+    this.loginBaseUrl = config.base_url ?? DEFAULT_BASE_URL;
     this.token = token;
     this.botType = config.bot_type ?? DEFAULT_BOT_TYPE;
-    this.version = config.version ?? "1.0.2";
+    this.version = config.version ?? ILINK_CHANNEL_VERSION;
     this.routeTag = config.route_tag ?? "";
     this.fetchImpl = config.fetch_impl ?? fetch;
     this.silkDecoder = config.silk_decoder;
@@ -202,34 +206,38 @@ export class Client {
   }
 
   async fetchQRCode(): Promise<QRCodeResponse> {
-    const url = new URL(this.buildUrl("ilink/bot/get_bot_qrcode"));
-    url.searchParams.set("bot_type", this.botType || DEFAULT_BOT_TYPE);
-
-    let response: APIResponse;
+    const savedBaseUrl = this.baseUrl;
+    this.baseUrl = this.loginBaseUrl;
     try {
-      response = await this.doGetText(url.toString(), this.routeTagHeaders(), DEFAULT_API_TIMEOUT);
-    } catch (error) {
-      throw new Error(`ilink: fetch QR code: ${this.errorMessage(error)}`, { cause: error });
-    }
+      const url = new URL(this.buildUrl("ilink/bot/get_bot_qrcode"));
+      url.searchParams.set("bot_type", this.botType || DEFAULT_BOT_TYPE);
 
-    try {
-      return this.withRawResponse(this.decodeJson<QRCodeResponse>(response.body, "fetchQRCode"), response);
-    } catch (error) {
-      throw new Error(`ilink: unmarshal QR response: ${this.errorMessage(error)}`, { cause: error });
+      let response: APIResponse;
+      try {
+        response = await this.doGetText(url.toString(), {}, DEFAULT_API_TIMEOUT);
+      } catch (error) {
+        throw new Error(`ilink: fetch QR code: ${this.errorMessage(error)}`, { cause: error });
+      }
+
+      try {
+        return this.withRawResponse(this.decodeJson<QRCodeResponse>(response.body, "fetchQRCode"), response);
+      } catch (error) {
+        throw new Error(`ilink: unmarshal QR response: ${this.errorMessage(error)}`, { cause: error });
+      }
+    } finally {
+      this.baseUrl = savedBaseUrl;
     }
   }
 
-  async pollQRStatus(qrcode: string): Promise<QRStatusResponse> {
-    const url = new URL(this.buildUrl("ilink/bot/get_qrcode_status"));
+  async pollQRStatus(qrcode: string, baseUrl?: string): Promise<QRStatusResponse> {
+    const base = (baseUrl || this.baseUrl).replace(/\/+$/, "");
+    const url = new URL(`${base}/ilink/bot/get_qrcode_status`);
     url.searchParams.set("qrcode", qrcode);
 
     try {
       const response = await this.doGetText(
         url.toString(),
-        {
-          ...this.routeTagHeaders(),
-          "iLink-App-ClientVersion": "1",
-        },
+        {},
         QR_LONG_POLL_TIMEOUT,
       );
 
@@ -249,6 +257,7 @@ export class Client {
 
   async loginWithQr(callbacks: LoginCallbacks = {}, timeoutMs = DEFAULT_LOGIN_TIMEOUT): Promise<LoginResult> {
     const deadline = Date.now() + timeoutMs;
+    const qrBaseUrl = this.loginBaseUrl;
     const qr = await this.fetchQRCode();
     let currentQr = qr.qrcode ?? "";
 
@@ -256,11 +265,12 @@ export class Client {
 
     let scannedNotified = false;
     let refreshCount = 1;
+    let pollBaseUrl = qrBaseUrl;
 
     while (Date.now() <= deadline) {
       let status: QRStatusResponse;
       try {
-        status = await this.pollQRStatus(currentQr);
+        status = await this.pollQRStatus(currentQr, pollBaseUrl);
       } catch (error) {
         throw new Error(`ilink: poll QR status: ${this.errorMessage(error)}`, { cause: error });
       }
@@ -270,6 +280,12 @@ export class Client {
           if (!scannedNotified) {
             scannedNotified = true;
             callbacks.on_scanned?.();
+          }
+          break;
+
+        case "scaned_but_redirect":
+          if (status.redirect_host) {
+            pollBaseUrl = `https://${status.redirect_host}`;
           }
           break;
 
@@ -557,12 +573,17 @@ export class Client {
       throw new APIError(uploadResponse.ret ?? 0, 0, uploadResponse.errmsg ?? "");
     }
 
-    if (!uploadResponse.upload_param) {
-      throw new Error("ilink: getUploadUrl returned no upload_param");
+    let cdnUrl: string;
+    const fullUrl = (uploadResponse.upload_full_url ?? "").trim();
+    if (fullUrl) {
+      cdnUrl = fullUrl;
+    } else if (uploadResponse.upload_param) {
+      cdnUrl = buildCdnUploadUrl(this.cdnBaseUrl, uploadResponse.upload_param, fileKey);
+    } else {
+      throw new Error("ilink: getUploadUrl returned no upload URL (need upload_full_url or upload_param)");
     }
 
     const ciphertext = encryptAesEcb(plainBytes, aesKey);
-    const cdnUrl = buildCdnUploadUrl(this.cdnBaseUrl, uploadResponse.upload_param, fileKey);
     const downloadParam = await this.uploadToCDN(cdnUrl, ciphertext);
 
     return {
@@ -574,16 +595,32 @@ export class Client {
     };
   }
 
-  async downloadFile(encryptedQueryParam: string, aesKeyBase64: string): Promise<Uint8Array> {
-    const key = parseAESKey(aesKeyBase64);
-    const downloadUrl = buildCdnDownloadUrl(this.cdnBaseUrl, encryptedQueryParam);
-    const ciphertext = await this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
+  async downloadMedia(media: CDNMedia | undefined): Promise<Uint8Array> {
+    if (!media) {
+      throw new Error("ilink: media is nil");
+    }
+    const key = parseAESKey(media.aes_key ?? "");
+    const dlUrl = this.resolveCDNDownloadURL(media);
+    const ciphertext = await this.doGetBytes(dlUrl, {}, DEFAULT_CDN_TIMEOUT);
     return decryptAesEcb(ciphertext, key);
   }
 
+  async downloadMediaRaw(media: CDNMedia | undefined): Promise<Uint8Array> {
+    if (!media) {
+      throw new Error("ilink: media is nil");
+    }
+    const dlUrl = this.resolveCDNDownloadURL(media);
+    return this.doGetBytes(dlUrl, {}, DEFAULT_CDN_TIMEOUT);
+  }
+
+  /** @deprecated Use {@link downloadMedia} which supports CDNMedia.full_url. */
+  async downloadFile(encryptedQueryParam: string, aesKeyBase64: string): Promise<Uint8Array> {
+    return this.downloadMedia({ encrypt_query_param: encryptedQueryParam, aes_key: aesKeyBase64 });
+  }
+
+  /** @deprecated Use {@link downloadMediaRaw} which supports CDNMedia.full_url. */
   async downloadRaw(encryptedQueryParam: string): Promise<Uint8Array> {
-    const downloadUrl = buildCdnDownloadUrl(this.cdnBaseUrl, encryptedQueryParam);
-    return this.doGetBytes(downloadUrl, {}, DEFAULT_CDN_TIMEOUT);
+    return this.downloadMediaRaw({ encrypt_query_param: encryptedQueryParam });
   }
 
   async downloadVoice(voice: VoiceItem | undefined): Promise<Uint8Array> {
@@ -595,11 +632,9 @@ export class Client {
       throw new Error("ilink: voice item or media is nil");
     }
 
-    const encryptedQueryParam = voice.media.encrypt_query_param ?? "";
-    const aesKey = voice.media.aes_key ?? "";
     let silkData: Uint8Array;
     try {
-      silkData = await this.downloadFile(encryptedQueryParam, aesKey);
+      silkData = await this.downloadMedia(voice.media);
     } catch (error) {
       throw new Error(`ilink: download voice: ${this.errorMessage(error)}`, { cause: error });
     }
@@ -642,8 +677,20 @@ export class Client {
     return `${this.baseUrl.replace(/\/+$/, "")}/${endpoint.replace(/^\/+/, "")}`;
   }
 
+  private commonHeaders(): Record<string, string> {
+    const headers: Record<string, string> = {
+      "iLink-App-Id": ILINK_APP_ID,
+      "iLink-App-ClientVersion": String(encodeClientVersion(this.version)),
+    };
+    if (this.routeTag) {
+      headers.SKRouteTag = this.routeTag;
+    }
+    return headers;
+  }
+
   private buildHeaders(body?: string | Buffer, extraHeaders: Record<string, string> = {}): Record<string, string> {
     const headers: Record<string, string> = {
+      ...this.commonHeaders(),
       AuthorizationType: "ilink_bot_token",
       "X-WECHAT-UIN": this.randomWechatUin(),
       ...extraHeaders,
@@ -658,10 +705,6 @@ export class Client {
       headers.Authorization = `Bearer ${token}`;
     }
 
-    if (this.routeTag) {
-      headers.SKRouteTag = this.routeTag;
-    }
-
     return headers;
   }
 
@@ -674,8 +717,14 @@ export class Client {
     };
   }
 
-  private routeTagHeaders(): Record<string, string> {
-    return this.routeTag ? { SKRouteTag: this.routeTag } : {};
+  private resolveCDNDownloadURL(media: CDNMedia): string {
+    if (media.full_url) {
+      return media.full_url;
+    }
+    if (media.encrypt_query_param) {
+      return buildCdnDownloadUrl(this.cdnBaseUrl, media.encrypt_query_param);
+    }
+    throw new Error("ilink: cdn media has no full_url or encrypt_query_param");
   }
 
   private async doPost(endpoint: string, payload: Record<string, unknown>, timeoutMs: number): Promise<APIResponse> {
@@ -689,12 +738,12 @@ export class Client {
     );
   }
 
-  private async doGetText(url: string, headers: Record<string, string>, timeoutMs: number): Promise<APIResponse> {
-    return this.requestText("GET", url, headers, undefined, timeoutMs);
+  private async doGetText(url: string, extraHeaders: Record<string, string>, timeoutMs: number): Promise<APIResponse> {
+    return this.requestText("GET", url, { ...this.commonHeaders(), ...extraHeaders }, undefined, timeoutMs);
   }
 
-  private async doGetBytes(url: string, headers: Record<string, string>, timeoutMs: number): Promise<Uint8Array> {
-    const response = await this.fetchResponse("GET", url, headers, undefined, timeoutMs);
+  private async doGetBytes(url: string, extraHeaders: Record<string, string>, timeoutMs: number): Promise<Uint8Array> {
+    const response = await this.fetchResponse("GET", url, { ...this.commonHeaders(), ...extraHeaders }, undefined, timeoutMs);
     const body = new Uint8Array(await response.arrayBuffer());
 
     if (response.status < 200 || response.status >= 300) {
@@ -859,7 +908,7 @@ export class Client {
   }
 
   private generateClientId(): string {
-    return `sdk-${Date.now()}-${randomBytes(4).toString("hex")}`;
+    return `openclaw-weixin:${Date.now()}-${randomBytes(4).toString("hex")}`;
   }
 
   private randomHex(n: number): string {
@@ -901,4 +950,12 @@ export class Client {
 
     return String(error);
   }
+}
+
+function encodeClientVersion(version: string): number {
+  const parts = version.split(".").map(Number);
+  const major = (parts[0] ?? 0) & 0xff;
+  const minor = (parts[1] ?? 0) & 0xff;
+  const patch = (parts[2] ?? 0) & 0xff;
+  return (major << 16) | (minor << 8) | patch;
 }
